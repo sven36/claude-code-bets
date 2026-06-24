@@ -165,7 +165,7 @@ import {
 import { CLAUDE_IN_CHROME_MCP_SERVER_NAME } from 'src/utils/claudeInChrome/common.js'
 import { CHROME_TOOL_SEARCH_INSTRUCTIONS } from 'src/utils/claudeInChrome/prompt.js'
 import { getMaxThinkingTokensForModel } from 'src/utils/context.js'
-import { logForDebugging } from 'src/utils/debug.js'
+import { logForDebugging, logToInspectorConsole } from 'src/utils/debug.js'
 import { logForDiagnosticsNoPII } from 'src/utils/diagLogs.js'
 import { type EffortValue, modelSupportsEffort } from 'src/utils/effort.js'
 import {
@@ -439,7 +439,7 @@ function configureEffortParams(
     betas.push(EFFORT_BETA_HEADER)
   } else if (typeof effortValue === 'string') {
     // Send string effort level as is
-    outputConfig.effort = effortValue as "high" | "medium" | "low" | "max"
+    outputConfig.effort = effortValue as 'high' | 'medium' | 'low' | 'max'
     betas.push(EFFORT_BETA_HEADER)
   } else if (process.env.USER_TYPE === 'ant') {
     // Numeric effort override - ant-only (uses anthropic_internal)
@@ -664,7 +664,9 @@ export function assistantMessageToMessageParam(
     content:
       typeof message.message.content === 'string'
         ? message.message.content
-        : message.message.content.map(stripGeminiProviderMetadata) as BetaContentBlockParam[],
+        : (message.message.content.map(
+            stripGeminiProviderMetadata,
+          ) as BetaContentBlockParam[]),
   }
 }
 
@@ -679,10 +681,8 @@ function stripGeminiProviderMetadata<T extends BetaContentBlockParam | string>(
   }
 
   const obj = contentBlock as unknown as Record<string, unknown>
-  const {
-    _geminiThoughtSignature: _unusedGeminiThoughtSignature,
-    ...rest
-  } = obj
+  const { _geminiThoughtSignature: _unusedGeminiThoughtSignature, ...rest } =
+    obj
   return rest as unknown as T
 }
 
@@ -718,6 +718,80 @@ export type Options = {
   // (query.ts decrements across the agentic loop).
   taskBudget?: { total: number; remaining?: number }
 }
+
+function summarizeRequestParams(
+  params: BetaMessageStreamParams,
+): Record<string, unknown> {
+  return {
+    model: params.model,
+    messageCount: params.messages.length,
+    systemBlockCount: Array.isArray(params.system) ? params.system.length : 0,
+    toolCount: params.tools?.length ?? 0,
+    max_tokens: params.max_tokens,
+    betas: params.betas ?? [],
+    thinking: params.thinking ?? null,
+    tool_choice: params.tool_choice ?? null,
+    metadata: params.metadata ?? null,
+  }
+}
+
+function summarizeStreamEvent(
+  part: BetaRawMessageStreamEvent,
+): Record<string, unknown> {
+  const summary: Record<string, unknown> = { type: part.type }
+  switch (part.type) {
+    case 'message_start':
+      summary.message = {
+        id: part.message?.id,
+        model: part.message?.model,
+        role: part.message?.role,
+        contentLength: part.message?.content?.length ?? 0,
+        usage: part.message?.usage,
+      }
+      break
+    case 'content_block_start':
+      summary.index = part.index
+      summary.content_block = {
+        type: part.content_block.type,
+        name:
+          'name' in part.content_block ? part.content_block.name : undefined,
+        id: 'id' in part.content_block ? part.content_block.id : undefined,
+      }
+      break
+    case 'content_block_delta':
+      summary.index = part.index
+      summary.delta = {
+        type: part.delta.type,
+        textLength:
+          'text' in part.delta && typeof part.delta.text === 'string'
+            ? part.delta.text.length
+            : undefined,
+        partialJsonLength:
+          'partial_json' in part.delta &&
+          typeof part.delta.partial_json === 'string'
+            ? part.delta.partial_json.length
+            : undefined,
+        thinkingLength:
+          'thinking' in part.delta && typeof part.delta.thinking === 'string'
+            ? part.delta.thinking.length
+            : undefined,
+      }
+      break
+    case 'content_block_stop':
+      summary.index = part.index
+      break
+    case 'message_delta':
+      summary.delta = part.delta
+      summary.usage = part.usage
+      break
+    case 'message_stop':
+      break
+    default:
+      break
+  }
+  return summary
+}
+
 
 export async function queryModelWithoutStreaming({
   messages,
@@ -865,6 +939,14 @@ export async function* executeNonStreamingRequest(
       const start = Date.now()
       const retryParams = paramsFromContext(context)
       captureRequest(retryParams)
+      logForDebugging(
+        `[API FALLBACK REQUEST] ${jsonStringify({
+          source: clientOptions.source,
+          mode: 'non-streaming',
+          summary: summarizeRequestParams(retryParams),
+          params: retryParams,
+        })}`,
+      )
       onAttempt(attempt, start, retryParams.max_tokens)
 
       const adjustedParams = adjustParamsForNonStreaming(
@@ -874,7 +956,7 @@ export async function* executeNonStreamingRequest(
 
       try {
         // biome-ignore lint/plugin: non-streaming API call
-        return await anthropic.beta.messages.create(
+        const response = (await anthropic.beta.messages.create(
           {
             ...adjustedParams,
             model: normalizeModelStringForAPI(adjustedParams.model),
@@ -883,7 +965,32 @@ export async function* executeNonStreamingRequest(
             signal: retryOptions.signal,
             timeout: fallbackTimeoutMs,
           },
+        )) as BetaMessage
+        logForDebugging(
+          `[API FALLBACK RESPONSE] ${jsonStringify({
+            source: clientOptions.source,
+            mode: 'non-streaming',
+            model: response.model,
+            id: response.id,
+            role: response.role,
+            stop_reason: response.stop_reason,
+            usage: response.usage,
+            contentLength: response.content?.length ?? 0,
+            response,
+          })}`,
         )
+        logRequestToBrowserConsole('[API FALLBACK RESPONSE]', {
+          source: clientOptions.source,
+          mode: 'non-streaming',
+          model: response.model,
+          id: response.id,
+          role: response.role,
+          stop_reason: response.stop_reason,
+          usage: response.usage,
+          contentLength: response.content?.length ?? 0,
+          response,
+        })
+        return response
       } catch (err) {
         // User aborts are not errors — re-throw immediately without logging
         if (err instanceof APIUserAbortError) throw err
@@ -1332,7 +1439,13 @@ async function* queryModel(
   // media stripping) but before Anthropic-specific logic (betas, thinking, caching).
   if (getAPIProvider() === 'openai') {
     const { queryModelOpenAI } = await import('./openai/index.js')
-    yield* queryModelOpenAI(messagesForAPI, systemPrompt, filteredTools, signal, options)
+    yield* queryModelOpenAI(
+      messagesForAPI,
+      systemPrompt,
+      filteredTools,
+      signal,
+      options,
+    )
     return
   }
 
@@ -1351,7 +1464,13 @@ async function* queryModel(
 
   if (getAPIProvider() === 'grok') {
     const { queryModelGrok } = await import('./grok/index.js')
-    yield* queryModelGrok(messagesForAPI, systemPrompt, filteredTools, signal, options)
+    yield* queryModelGrok(
+      messagesForAPI,
+      systemPrompt,
+      filteredTools,
+      signal,
+      options,
+    )
     return
   }
 
@@ -1837,6 +1956,14 @@ async function* queryModel(
 
         const params = paramsFromContext(context)
         captureAPIRequest(params, options.querySource) // Capture for bug reports
+        logForDebugging(
+          `[API STREAM REQUEST] ${jsonStringify({
+            source: options.querySource,
+            mode: 'streaming',
+            summary: summarizeRequestParams(params),
+            params,
+          })}`,
+        )
 
         maxOutputTokens = params.max_tokens
 
@@ -1874,6 +2001,17 @@ async function* queryModel(
         queryCheckpoint('query_response_headers_received')
         streamRequestId = result.request_id
         streamResponse = result.response
+        responseHeaders = result.response.headers
+        logForDebugging(
+          `[API STREAM RESPONSE] ${jsonStringify({
+            source: options.querySource,
+            mode: 'streaming',
+            request_id: result.request_id,
+            status: result.response.status,
+            streamResponse: result.response,
+            headers: Object.fromEntries(result.response.headers.entries()),
+          })}`,
+        )
         return result.data
       },
       {
@@ -1981,6 +2119,14 @@ async function* queryModel(
       for await (const part of stream) {
         resetStreamIdleTimer()
         const now = Date.now()
+        logForDebugging(
+          `[API STREAM EVENT] ${jsonStringify({
+            source: options.querySource,
+            request_id: streamRequestId,
+            summary: summarizeStreamEvent(part),
+            event: part,
+          })}`,
+        )
 
         // Detect and log streaming stalls (only after first event to avoid counting TTFB)
         if (lastEventTime !== null) {
@@ -2119,7 +2265,8 @@ async function* queryModel(
                 })
                 throw new Error('Content block is not a connector_text block')
               }
-              ;(contentBlock as { connector_text: string }).connector_text += delta.connector_text
+              ;(contentBlock as { connector_text: string }).connector_text +=
+                delta.connector_text
             } else {
               switch (delta.type) {
                 case 'citations_delta':
@@ -2198,7 +2345,8 @@ async function* queryModel(
                     })
                     throw new Error('Content block is not a thinking block')
                   }
-                  ;(contentBlock as { thinking: string }).thinking += delta.thinking
+                  ;(contentBlock as { thinking: string }).thinking +=
+                    delta.thinking
                   break
               }
             }
@@ -2289,7 +2437,10 @@ async function* queryModel(
             }
 
             // Update cost
-            const costUSDForPart = calculateUSDCost(resolvedModel, usage as unknown as BetaUsage)
+            const costUSDForPart = calculateUSDCost(
+              resolvedModel,
+              usage as unknown as BetaUsage,
+            )
             costUSD += addToTotalSessionCost(
               costUSDForPart,
               usage as unknown as BetaUsage,
@@ -2859,10 +3010,14 @@ async function* queryModel(
     // message_delta handler before any yield. Fallback pushes to newMessages
     // then yields, so tracking must be here to survive .return() at the yield.
     if (fallbackMessage) {
-      const fallbackUsage = fallbackMessage.message.usage as BetaMessageDeltaUsage
+      const fallbackUsage = fallbackMessage.message
+        .usage as BetaMessageDeltaUsage
       usage = updateUsage(EMPTY_USAGE, fallbackUsage)
       stopReason = fallbackMessage.message.stop_reason as BetaStopReason
-      const fallbackCost = calculateUSDCost(resolvedModel, fallbackUsage as unknown as BetaUsage)
+      const fallbackCost = calculateUSDCost(
+        resolvedModel,
+        fallbackUsage as unknown as BetaUsage,
+      )
       costUSD += addToTotalSessionCost(
         fallbackCost,
         fallbackUsage as unknown as BetaUsage,
@@ -2898,7 +3053,9 @@ async function* queryModel(
   void options.getToolPermissionContext().then(permissionContext => {
     logAPISuccessAndDuration({
       model:
-        (newMessages[0]?.message.model as string | undefined) ?? partialMessage?.model ?? options.model,
+        (newMessages[0]?.message.model as string | undefined) ??
+        partialMessage?.model ??
+        options.model,
       preNormalizedModel: options.model,
       usage,
       start,

@@ -3,7 +3,11 @@ import { createHash } from 'crypto'
 import { promises as fs } from 'fs'
 import { dirname, join } from 'path'
 import { getSessionId } from 'src/bootstrap/state.js'
-import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
+import { logForDebugging } from '../../utils/debug.js'
+import {
+  getClaudeConfigHomeDir,
+  isEnvTruthy,
+} from '../../utils/envUtils.js'
 import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
 
 function hashString(str: string): string {
@@ -26,6 +30,10 @@ type DumpState = {
 // Track state per session to avoid duplicating data
 const dumpState = new Map<string, DumpState>()
 
+function shouldDumpPrompts(): boolean {
+  return true
+}
+
 export function getLastApiRequests(): Array<{
   timestamp: string
   request: unknown
@@ -46,7 +54,7 @@ export function clearAllDumpState(): void {
 }
 
 export function addApiRequestToCache(requestData: unknown): void {
-  if (process.env.USER_TYPE !== 'ant') return
+  if (!shouldDumpPrompts()) return
   cachedApiRequests.push({
     timestamp: new Date().toISOString(),
     request: requestData,
@@ -66,6 +74,9 @@ export function getDumpPromptsPath(agentIdOrSessionId?: string): string {
 
 function appendToFile(filePath: string, entries: string[]): void {
   if (entries.length === 0) return
+  for (const entry of entries) {
+    logForDebugging(`[DUMP] ${entry}`)
+  }
   fs.mkdir(dirname(filePath), { recursive: true })
     .then(() => fs.appendFile(filePath, entries.join('\n') + '\n'))
     .catch(() => {})
@@ -87,19 +98,23 @@ function initFingerprint(req: Record<string, unknown>): string {
   return `${req.model}|${toolNames}|${sysLen}`
 }
 
+type RequestMeta = { url: string; method: string }
+
 function dumpRequest(
   body: string,
   ts: string,
   state: DumpState,
   filePath: string,
+  meta: RequestMeta,
 ): void {
   try {
     const req = jsonParse(body) as Record<string, unknown>
     addApiRequestToCache(req)
 
-    if (process.env.USER_TYPE !== 'ant') return
+    if (!shouldDumpPrompts()) return
     const entries: string[] = []
     const messages = (req.messages ?? []) as Array<{ role?: string }>
+    const metaStr = jsonStringify(meta)
 
     // Write init data (system, tools, metadata) on first request,
     // and a system_update entry whenever it changes.
@@ -117,12 +132,12 @@ function dumpRequest(
         // Reuse initDataStr rather than re-serializing initData inside a wrapper.
         // timestamp from toISOString() contains no chars needing JSON escaping.
         entries.push(
-          `{"type":"init","timestamp":"${ts}","data":${initDataStr}}`,
+          `{"type":"init","timestamp":"${ts}","request":${metaStr},"data":${initDataStr}}`,
         )
       } else if (initDataHash !== state.lastInitDataHash) {
         state.lastInitDataHash = initDataHash
         entries.push(
-          `{"type":"system_update","timestamp":"${ts}","data":${initDataStr}}`,
+          `{"type":"system_update","timestamp":"${ts}","request":${metaStr},"data":${initDataStr}}`,
         )
       }
     }
@@ -131,7 +146,12 @@ function dumpRequest(
     for (const msg of messages.slice(state.messageCountSeen)) {
       if (msg.role === 'user') {
         entries.push(
-          jsonStringify({ type: 'message', timestamp: ts, data: msg }),
+          jsonStringify({
+            type: 'message',
+            timestamp: ts,
+            request: meta,
+            data: msg,
+          }),
         )
       }
     }
@@ -157,6 +177,16 @@ export function createDumpPromptsFetch(
     }
     dumpState.set(agentIdOrSessionId, state)
 
+    const url =
+      input instanceof Request
+        ? input.url
+        : input instanceof URL
+          ? input.toString()
+          : String(input)
+    const method =
+      init?.method ?? (input instanceof Request ? input.method : 'GET')
+    const meta: RequestMeta = { url, method }
+
     let timestamp: string | undefined
 
     if (init?.method === 'POST' && init.body) {
@@ -164,14 +194,21 @@ export function createDumpPromptsFetch(
       // Parsing + stringifying the request (system prompt + tool schemas = MBs)
       // takes hundreds of ms. Defer so it doesn't block the actual API call —
       // this is debug tooling for /issue, not on the critical path.
-      setImmediate(dumpRequest, init.body as string, timestamp, state, filePath)
+      setImmediate(
+        dumpRequest,
+        init.body as string,
+        timestamp,
+        state,
+        filePath,
+        meta,
+      )
     }
 
     // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
     const response = await globalThis.fetch(input, init)
 
     // Save response async
-    if (timestamp && response.ok && process.env.USER_TYPE === 'ant') {
+    if (timestamp && response.ok && shouldDumpPrompts()) {
       const cloned = response.clone()
       void (async () => {
         try {
@@ -211,10 +248,19 @@ export function createDumpPromptsFetch(
             data = await cloned.json()
           }
 
-          await fs.appendFile(
-            filePath,
-            jsonStringify({ type: 'response', timestamp, data }) + '\n',
-          )
+          const responseEntry = jsonStringify({
+            type: 'response',
+            timestamp,
+            request: {
+              ...meta,
+              status: response.status,
+              statusText: response.statusText,
+              requestId: response.headers.get('request-id') ?? undefined,
+            },
+            data,
+          })
+          logForDebugging(`[DUMP] ${responseEntry}`)
+          await fs.appendFile(filePath, responseEntry + '\n')
         } catch {
           // Best effort
         }

@@ -4,7 +4,7 @@
 		{
 			"label": "Start Claude Code TUI",
 			"type": "shell",
-			"command": "bun run dev:inspect",
+			"command": "bun run dev:inspect-log",
 			"isBackground": true,
 			"presentation": {
 				"reveal": "always",

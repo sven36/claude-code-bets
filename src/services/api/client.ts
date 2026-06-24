@@ -22,12 +22,16 @@ import {
   getSessionId,
 } from '../../bootstrap/state.js'
 import { getOauthConfig } from '../../constants/oauth.js'
-import { isDebugToStdErr, logForDebugging } from '../../utils/debug.js'
+import {
+  isDebugToStdErr,
+  logForDebugging,
+} from '../../utils/debug.js'
 import {
   getAWSRegion,
   getVertexRegionForModel,
   isEnvTruthy,
 } from '../../utils/envUtils.js'
+import { jsonStringify } from '../../utils/slowOperations.js'
 
 /**
  * Environment variables for different client types:
@@ -355,6 +359,55 @@ function getCustomHeaders(): Record<string, string> {
 
 export const CLIENT_REQUEST_ID_HEADER = 'x-client-request-id'
 
+function redactHeaderValue(name: string, value: string): string {
+  const normalized = name.toLowerCase()
+  if (
+    normalized === 'authorization' ||
+    normalized === 'x-api-key' ||
+    normalized === 'anthropic-api-key'
+  ) {
+    if (value.length <= 12) return '[REDACTED]'
+    return `${value.slice(0, 6)}...[REDACTED]...${value.slice(-4)}`
+  }
+  return value
+}
+
+function headersToLogObject(headers: Headers): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const [name, value] of headers.entries()) {
+    result[name] = redactHeaderValue(name, value)
+  }
+  return result
+}
+
+function bodyToLogValue(body: BodyInit | null | undefined): unknown {
+  if (body == null) return null
+  if (typeof body === 'string') {
+    try {
+      return JSON.parse(body)
+    } catch {
+      return body
+    }
+  }
+  if (body instanceof URLSearchParams) {
+    return body.toString()
+  }
+  if (body instanceof Uint8Array) {
+    return `[Uint8Array length=${body.byteLength}]`
+  }
+  if (body instanceof ArrayBuffer) {
+    return `[ArrayBuffer byteLength=${body.byteLength}]`
+  }
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    return '[FormData]'
+  }
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+    return '[ReadableStream]'
+  }
+  return `[${Object.prototype.toString.call(body)}]`
+}
+
+
 function buildFetch(
   fetchOverride: ClientOptions['fetch'],
   source: string | undefined,
@@ -365,7 +418,7 @@ function buildFetch(
   // and unknown headers risk rejection by strict proxies (inc-4029 class).
   const injectClientRequestId =
     getAPIProvider() === 'firstParty' && isFirstPartyAnthropicBaseUrl()
-  return (input, init) => {
+  return async (input, init) => {
     // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
     const headers = new Headers(init?.headers)
     // Generate a client-side request ID so timeouts (which return no server
@@ -377,13 +430,43 @@ function buildFetch(
     try {
       // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
       const url = input instanceof Request ? input.url : String(input)
+      const method =
+        init?.method ?? (input instanceof Request ? input.method : 'GET')
       const id = headers.get(CLIENT_REQUEST_ID_HEADER)
       logForDebugging(
         `[API REQUEST] ${new URL(url).pathname}${id ? ` ${CLIENT_REQUEST_ID_HEADER}=${id}` : ''} source=${source ?? 'unknown'}`,
       )
+      logForDebugging(
+        `[API REQUEST DETAIL] ${jsonStringify({
+          source: source ?? 'unknown',
+          method,
+          url,
+          headers: headersToLogObject(headers),
+          body: bodyToLogValue(
+            init?.body ?? (input instanceof Request ? input.body : undefined),
+          ),
+        })}`,
+      )
     } catch {
       // never let logging crash the fetch
     }
-    return inner(input, { ...init, headers })
+    const response = await inner(input, { ...init, headers })
+    try {
+      // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
+      const url = input instanceof Request ? input.url : String(input)
+      logForDebugging(
+        `[API RESPONSE HEADERS] ${jsonStringify({
+          source: source ?? 'unknown',
+          url,
+          status: response.status,
+          statusText: response.statusText,
+          ok: response.ok,
+          headers: headersToLogObject(response.headers),
+        })}`,
+      )
+    } catch {
+      // never let logging crash the fetch
+    }
+    return response
   }
 }

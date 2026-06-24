@@ -17,6 +17,14 @@ import { jsonStringify } from './slowOperations.js'
 
 export type DebugLogLevel = 'verbose' | 'debug' | 'info' | 'warn' | 'error'
 
+const nativeConsole = {
+  log: console.log.bind(console),
+  info: console.info.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+  debug: console.debug.bind(console),
+}
+
 const LEVEL_ORDER: Record<DebugLogLevel, number> = {
   verbose: 0,
   debug: 1,
@@ -83,9 +91,7 @@ export const getDebugFilter = memoize((): DebugFilter | null => {
 })
 
 export const isDebugToStdErr = memoize((): boolean => {
-  return (
-    process.argv.includes('--debug-to-stderr')
-  )
+  return process.argv.includes('--debug-to-stderr')
 })
 
 export const getDebugFilePath = memoize((): string | null => {
@@ -233,6 +239,22 @@ export function getDebugLogPath(): string {
     process.env.CLAUDE_CODE_DEBUG_LOGS_DIR ??
     join(getClaudeConfigHomeDir(), 'debug', `${getSessionId()}.txt`)
   )
+}
+
+export function logToInspectorConsole(
+  level: 'log' | 'info' | 'warn' | 'error' | 'debug',
+  message: string,
+  payload?: unknown,
+): void {
+  try {
+    if (payload === undefined) {
+      nativeConsole[level](message)
+      return
+    }
+    nativeConsole[level](message, payload)
+  } catch {
+    // never let inspector-console logging crash the process
+  }
 }
 
 /**

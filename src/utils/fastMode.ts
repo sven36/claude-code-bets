@@ -132,7 +132,7 @@ export function getFastModeUnavailableReason(): string | null {
     const authType: AuthType =
       getClaudeAIOAuthTokens() !== null ? 'oauth' : 'api-key'
     const reason = getDisabledReasonMessage(orgStatus.reason, authType)
-    logForDebugging(`Fast mode unavailable: ${reason}`)
+    // logForDebugging(`Fast mode unavailable: ${reason}`)
     return reason
   }
 

@@ -5767,6 +5767,7 @@ async function run(): Promise<CommanderCommand> {
 				debug?: boolean;
 				verbose?: boolean;
 			}) => {
+				console.log("Starting MCP server...");
 				const { mcpServeHandler } =
 					await import("./cli/handlers/mcp.js");
 				await mcpServeHandler({ debug, verbose });

@@ -585,9 +585,9 @@ async function* queryLoop(
     // instead of all request bodies from the session (~500MB for long sessions).
     // Note: agentId is effectively constant during a query() call - it only changes
     // between queries (e.g., /clear command or session resume).
-    const dumpPromptsFetch = config.gates.isAnt
-      ? createDumpPromptsFetch(toolUseContext.agentId ?? config.sessionId)
-      : undefined
+    const dumpPromptsFetch = createDumpPromptsFetch(
+      toolUseContext.agentId ?? config.sessionId,
+    )
 
     // Block if we've hit the hard blocking limit (only applies when auto-compact is OFF)
     // This reserves space so users can still run /compact manually
